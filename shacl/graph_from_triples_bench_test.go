@@ -43,7 +43,9 @@ ex:NoSelfPart a sh:NodeShape ; sh:targetClass ex:Item ;
 // BenchmarkGraphFromTriples validates triples a program already holds.
 // "wrapped" is the path available without NewGraphFromTriples: add the triples
 // to a graph.Graph and wrap it with NewGraphFromRDF. "fromTriples" hands the
-// slice over. With a SPARQL constraint the store is built in both cases.
+// slice over. "fromRDFTriples" fills a graph.Graph in another goroutine while
+// NewGraphFromRDFTriples indexes the same slice. With a SPARQL constraint the
+// store is built in all three cases.
 func BenchmarkGraphFromTriples(b *testing.B) {
 	for _, shapes := range []struct{ name, ttl string }{{"core", benchItemShapes}, {"sparql", benchItemSPARQLShapes}} {
 		sg, err := LoadTurtleString(shapes.ttl, "")
@@ -77,6 +79,30 @@ func BenchmarkGraphFromTriples(b *testing.B) {
 				b.ReportAllocs()
 				for b.Loop() {
 					benchReport = cs.Validate(NewGraphFromTriples(ts, ""))
+				}
+			})
+			b.Run(name+"/fromRDFTriples", func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					rg := graph.NewGraph()
+					filled := make(chan error, 1)
+					go func() {
+						for _, t := range ts {
+							if err := rg.Add(b.Context(), t.Subject, t.Predicate, t.Object); err != nil {
+								filled <- err
+								return
+							}
+						}
+						filled <- nil
+					}()
+					g, err := NewGraphFromRDFTriples(b.Context(), rg, ts, "")
+					if err != nil {
+						b.Fatal(err)
+					}
+					if err := <-filled; err != nil {
+						b.Fatal(err)
+					}
+					benchReport = cs.Validate(g)
 				}
 			})
 			if r := cs.Validate(NewGraphFromTriples(ts, "")); !r.Conforms {

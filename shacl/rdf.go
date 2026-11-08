@@ -7,6 +7,7 @@ package shacl
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -284,6 +285,10 @@ type Graph struct {
 	// readErr is the error of the last lazy index build that failed (see Err).
 	errMu   sync.Mutex
 	readErr error
+
+	// distinct: src holds no repeated triple (NewGraphFromRDFTriples), so
+	// indexing it skips the duplicate check.
+	distinct bool
 }
 
 // Err returns the error of the most recent failed attempt to read the wrapped
@@ -513,6 +518,40 @@ func NewGraphFromRDF(ctx context.Context, g *graph.Graph, baseURI string) (*Grap
 	return out, nil
 }
 
+// NewGraphFromRDFTriples returns a graph over rg, as NewGraphFromRDF does, for a
+// caller that also holds rg's triples in memory (it built rg from them): the
+// indexes are built from triples instead of reading rg's store. They can
+// therefore be built while another goroutine is still adding the same
+// triples to rg; rg is used only for what reads the store (SPARQL-based
+// constraints, SHACL-AF, Add, Merge), once the caller has finished filling it.
+//
+// triples must hold exactly the triples rg holds once filled, each once: they
+// are indexed without a duplicate check. The slice is not copied and must not
+// be modified while the graph is in use. rg's namespace bindings are read here,
+// so they must be bound before the call (NewGraph binds its defaults itself).
+//
+// The index is a snapshot, as with NewGraphFromRDF: change rg only through this
+// Graph's Add/Merge, or call InvalidateIndexes; the next read then indexes rg.
+func NewGraphFromRDFTriples(ctx context.Context, rg *graph.Graph, triples []term.Triple, baseURI string) (*Graph, error) {
+	if rg == nil {
+		return nil, errors.New("shacl: NewGraphFromRDFTriples needs the rdflib graph, got nil")
+	}
+	out := &Graph{src: triples, baseURI: baseURI, distinct: true}
+	idx, err := out.ensureIndexesContext(ctx) // from src: rg is not attached yet
+	if err != nil {
+		return nil, err
+	}
+	for b, err := range rg.Namespaces(ctx) {
+		if err != nil {
+			return nil, fmt.Errorf("shacl: reading the graph's namespaces: %w", err)
+		}
+		idx.ns = append(idx.ns, b)
+	}
+	out.src = nil
+	out.rg.Store(rg)
+	return out, nil
+}
+
 // InvalidateIndexes discards the lazily built SPO/POS indexes, forcing the
 // next read to rebuild them from the wrapped graph. Call this after mutating
 // the graph.Graph passed to NewGraphFromRDF directly, outside of this
@@ -581,7 +620,7 @@ func (g *Graph) ensureIndexesContext(ctx context.Context) (*graphIndexes, error)
 		p:   make(map[ikey][]Triple),
 	}
 	// A streamed source may repeat a triple; a graph holds it once.
-	dedup := g.rg.Load() == nil
+	dedup := g.rg.Load() == nil && !g.distinct
 	add := func(t term.Triple) {
 		if tt, ok := t.Object.(term.TripleTerm); ok && t.Predicate.Value() == RDF+"reifies" {
 			r := fromRDFLib(t.Subject)
